@@ -1,18 +1,15 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-import json
 import hashlib
-import unicodedata
+import json
 import re
+import unicodedata
 from datetime import datetime, timezone
 from math import isfinite
 
 app = FastAPI()
 
-
-# ============================================================
-# CONSTANTS
-# ============================================================
+MAX_SAFE_INTEGER = 9007199254740991
 
 EXPECTED_ROW_KEYS = {
     "id",
@@ -21,8 +18,6 @@ EXPECTED_ROW_KEYS = {
     "revision",
     "text",
 }
-
-MAX_SAFE_INTEGER = 9007199254740991
 
 TIME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}"
@@ -34,59 +29,42 @@ TIME_RE = re.compile(
 GENERATION_RE = re.compile(r"^[0-9]+$")
 CRC_RE = re.compile(r"^[0-9a-f]{8}$")
 
-OBJ_CODES = {
-    "URI_INVALID",
-    "GENERATION_INVALID",
-    "GENERATION_MISMATCH",
-    "CRC32C_INVALID",
-    "CRC32C_MISMATCH",
-    "SCHEMA_INVALID",
-    "JSONL_INVALID",
-}
-
-ROW_CODES = {
-    "DUPLICATE",
-    "POLICY_INVALID",
-    "OUT_OF_WINDOW",
-    "TRAIN_CONTAMINATION",
-}
-
 
 # ============================================================
 # CRC32C
 # ============================================================
 
-POLY = 0x82F63B78
-CRC_TABLE = []
+CRC32C_POLY = 0x82F63B78
+
+CRC32C_TABLE = []
 
 for i in range(256):
-    c = i
+    crc = i
 
     for _ in range(8):
-        if c & 1:
-            c = (c >> 1) ^ POLY
+        if crc & 1:
+            crc = (crc >> 1) ^ CRC32C_POLY
         else:
-            c >>= 1
+            crc >>= 1
 
-    CRC_TABLE.append(c)
+    CRC32C_TABLE.append(crc)
 
 
 def crc32c(data: bytes) -> int:
     crc = 0xFFFFFFFF
 
     for byte in data:
-        crc = CRC_TABLE[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+        crc = (
+            CRC32C_TABLE[(crc ^ byte) & 0xFF]
+            ^ (crc >> 8)
+        )
 
     return (~crc) & 0xFFFFFFFF
 
 
 # ============================================================
-# DETERMINISTIC HELPERS
+# JSON / SORT HELPERS
 # ============================================================
-
-def utf8_key(value: str) -> bytes:
-    return value.encode("utf-8")
-
 
 def compact_json(value) -> str:
     return json.dumps(
@@ -96,10 +74,14 @@ def compact_json(value) -> str:
     )
 
 
-def sorted_reason_codes(codes):
+def utf8(value: str) -> bytes:
+    return value.encode("utf-8")
+
+
+def sort_reason_codes(codes):
     return sorted(
         set(codes),
-        key=lambda x: x.encode("utf-8")
+        key=lambda x: utf8(x)
     )
 
 
@@ -107,13 +89,15 @@ def sorted_reason_codes(codes):
 # URI
 # ============================================================
 
-def valid_uri(uri) -> bool:
-    if not isinstance(uri, str):
+def valid_uri(value) -> bool:
+    if not isinstance(value, str):
         return False
 
     # gs://bucket/object
-    # Bucket must be non-empty and object must be non-empty.
-    return re.fullmatch(r"gs://[^/]+/.+", uri) is not None
+    return re.fullmatch(
+        r"gs://[^/]+/.+",
+        value
+    ) is not None
 
 
 # ============================================================
@@ -121,10 +105,10 @@ def valid_uri(uri) -> bool:
 # ============================================================
 
 def valid_generation(value) -> bool:
-    return (
-        isinstance(value, str)
-        and GENERATION_RE.fullmatch(value) is not None
-    )
+    if not isinstance(value, str):
+        return False
+
+    return GENERATION_RE.fullmatch(value) is not None
 
 
 # ============================================================
@@ -132,19 +116,6 @@ def valid_generation(value) -> bool:
 # ============================================================
 
 def parse_time(value):
-    """
-    Accept:
-      YYYY-MM-DDTHH:mm:ssZ
-      YYYY-MM-DDTHH:mm:ss.sZ
-      YYYY-MM-DDTHH:mm:ss.ssZ
-      YYYY-MM-DDTHH:mm:ss.sssZ
-
-    or the same with ±HH:mm offset.
-
-    Calendar validity is delegated to datetime.
-    Offset magnitude is explicitly checked.
-    """
-
     if not isinstance(value, str):
         return None
 
@@ -153,30 +124,29 @@ def parse_time(value):
 
     try:
         if value.endswith("Z"):
-            iso_value = value[:-1] + "+00:00"
+            iso = value[:-1] + "+00:00"
         else:
-            iso_value = value
+            iso = value
 
-        dt = datetime.fromisoformat(iso_value)
+        dt = datetime.fromisoformat(iso)
 
         offset = dt.utcoffset()
 
         if offset is None:
             return None
 
-        total_seconds = int(offset.total_seconds())
+        total_minutes = abs(
+            int(offset.total_seconds()) // 60
+        )
 
-        absolute_minutes = abs(total_seconds) // 60
+        hours = total_minutes // 60
+        minutes = total_minutes % 60
 
-        offset_hours = absolute_minutes // 60
-        offset_minutes = absolute_minutes % 60
-
-        # Maximum magnitude is 14:00.
-        # Therefore 14:01, 14:30 etc. are invalid.
-        if offset_hours > 14:
+        # Maximum allowed offset is 14:00.
+        if hours > 14:
             return None
 
-        if offset_hours == 14 and offset_minutes != 0:
+        if hours == 14 and minutes != 0:
             return None
 
         return dt.astimezone(timezone.utc)
@@ -198,14 +168,17 @@ def normalize_event_time(dt) -> str:
 # CANONICALIZATION
 # ============================================================
 
-def canonical_text(value: str) -> str:
+def canonicalize(value: str) -> str:
+    # Unicode NFKC
     value = unicodedata.normalize("NFKC", value)
 
+    # Lowercase
     value = value.lower()
 
+    # Trim
     value = value.strip()
 
-    # Unicode whitespace -> one ASCII space.
+    # Collapse Unicode whitespace to one ASCII space
     value = re.sub(r"\s+", " ", value)
 
     return value
@@ -216,14 +189,15 @@ def canonical_text(value: str) -> str:
 # ============================================================
 
 def valid_row(row) -> bool:
+
     if not isinstance(row, dict):
         return False
 
-    # Exactly the required five keys.
+    # Exactly these five keys.
     if set(row.keys()) != EXPECTED_ROW_KEYS:
         return False
 
-    # Four text fields.
+    # id, entity, eventTime, text must be strings.
     if not isinstance(row["id"], str):
         return False
 
@@ -236,18 +210,20 @@ def valid_row(row) -> bool:
     if not isinstance(row["text"], str):
         return False
 
-    # Revision: non-negative safe integer.
-    bool_is_int = isinstance(row["revision"], bool)
-
-    if (
-        not isinstance(row["revision"], int)
-        or bool_is_int
-        or row["revision"] < 0
-        or row["revision"] > MAX_SAFE_INTEGER
-    ):
+    # revision must be a non-negative safe integer.
+    if isinstance(row["revision"], bool):
         return False
 
-    # Event time must be valid.
+    if not isinstance(row["revision"], int):
+        return False
+
+    if row["revision"] < 0:
+        return False
+
+    if row["revision"] > MAX_SAFE_INTEGER:
+        return False
+
+    # eventTime must be valid.
     if parse_time(row["eventTime"]) is None:
         return False
 
@@ -260,28 +236,36 @@ def valid_row(row) -> bool:
 
 def word_set(text: str):
     """
-    Lowercase Unicode letter/number word set.
+    Lowercase Unicode letter/number word-set.
 
-    A word consists of consecutive Unicode letters/numbers.
+    Unicode letters/numbers are retained.
+    Punctuation and separators delimit words.
     """
 
-    words = re.findall(r"[\w]+", text, flags=re.UNICODE)
+    words = set()
+    current = []
 
-    result = set()
+    for char in text:
 
-    for word in words:
-        cleaned = "".join(
-            ch for ch in word
-            if ch.isalnum()
+        if char.isalnum():
+            current.append(char)
+        else:
+            if current:
+                words.add(
+                    "".join(current).lower()
+                )
+                current = []
+
+    if current:
+        words.add(
+            "".join(current).lower()
         )
 
-        if cleaned:
-            result.add(cleaned.lower())
-
-    return result
+    return words
 
 
 def jaccard(a, b) -> float:
+
     if not a and not b:
         return 1.0
 
@@ -294,14 +278,14 @@ def jaccard(a, b) -> float:
 
 
 # ============================================================
-# REQUEST
+# ENDPOINT
 # ============================================================
 
 @app.post("/build-corpus")
 async def build_corpus(request: Request):
 
     # --------------------------------------------------------
-    # Parse JSON request
+    # REQUEST PARSING
     # --------------------------------------------------------
 
     try:
@@ -318,18 +302,18 @@ async def build_corpus(request: Request):
             status_code=400
         )
 
-    # Missing policy -> INVALID_INPUT.
-    #
-    # A policy that exists but is malformed is NOT an invalid
-    # request. It makes the policy invalid and therefore all
-    # retained rows get POLICY_INVALID.
+    # Missing policy -> HTTP 400.
     if "policy" not in body:
         return JSONResponse(
             {"error": "INVALID_INPUT"},
             status_code=400
         )
 
-    if "objects" not in body or not isinstance(body["objects"], list):
+    # objects must exist and be an array.
+    if (
+        "objects" not in body
+        or not isinstance(body["objects"], list)
+    ):
         return JSONResponse(
             {"error": "INVALID_INPUT"},
             status_code=400
@@ -342,7 +326,7 @@ async def build_corpus(request: Request):
     rejected_rows = []
     lineage = []
 
-    parsed_rows = []
+    accepted_rows = []
 
 
     # ========================================================
@@ -351,27 +335,18 @@ async def build_corpus(request: Request):
 
     for obj in objects:
 
-        # ----------------------------------------------------
-        # Object must be an object.
-        # Since all independent object checks are applicable,
-        # a non-dict object gets the relevant object-level
-        # failures.
-        # ----------------------------------------------------
-
+        # An object entry which isn't an object cannot provide
+        # valid object fields.
         if not isinstance(obj, dict):
-
             rejected_objects.append({
                 "uri": None,
-                "reasonCodes": sorted_reason_codes([
-                    "URI_INVALID",
-                    "GENERATION_INVALID",
-                    "CRC32C_INVALID",
-                    "SCHEMA_INVALID",
-                ])
+                "reasonCodes": [
+                    "SCHEMA_INVALID"
+                ]
             })
-
             continue
 
+        reasons = []
 
         # ----------------------------------------------------
         # URI
@@ -379,37 +354,40 @@ async def build_corpus(request: Request):
 
         uri = obj.get("uri")
 
-        reasons = []
-
         if not valid_uri(uri):
             reasons.append("URI_INVALID")
 
 
         # ----------------------------------------------------
-        # GENERATIONS
+        # GENERATION
         # ----------------------------------------------------
 
         generation = obj.get("generation")
-        fetched_generation = obj.get("fetchedGeneration")
+        fetched_generation = obj.get(
+            "fetchedGeneration"
+        )
 
-        generation_valid = valid_generation(generation)
+        generation_valid = valid_generation(
+            generation
+        )
+
         fetched_generation_valid = valid_generation(
             fetched_generation
         )
 
-        if not generation_valid or not fetched_generation_valid:
+        if (
+            not generation_valid
+            or not fetched_generation_valid
+        ):
             reasons.append("GENERATION_INVALID")
 
-        # The supplied values are unequal.
-        #
-        # We check this independently from validity so that
-        # every applicable object code is emitted.
+        # Equality is checked independently.
         if generation != fetched_generation:
             reasons.append("GENERATION_MISMATCH")
 
 
         # ----------------------------------------------------
-        # CRC32C
+        # CRC32C SYNTAX
         # ----------------------------------------------------
 
         crc = obj.get("crc32c")
@@ -430,24 +408,28 @@ async def build_corpus(request: Request):
         content = obj.get("content")
         schema_id = obj.get("schemaId")
 
-        if (
-            not isinstance(content, str)
-            or schema_id != "training-v1"
-        ):
+        if not isinstance(content, str):
+            reasons.append("SCHEMA_INVALID")
+
+        if schema_id != "training-v1":
             reasons.append("SCHEMA_INVALID")
 
 
         # ----------------------------------------------------
-        # CRC32C MISMATCH
+        # CRC32C VALUE
         #
-        # Only check mismatch when:
-        #   - content is a string
-        #   - CRC syntax is valid
+        # Only compare when:
+        #   content is a string
+        #   CRC syntax is valid
         # ----------------------------------------------------
 
-        if isinstance(content, str) and crc_valid:
-
-            actual_crc = f"{crc32c(content.encode('utf-8')):08x}"
+        if (
+            isinstance(content, str)
+            and crc_valid
+        ):
+            actual_crc = (
+                f"{crc32c(content.encode('utf-8')):08x}"
+            )
 
             if actual_crc != crc:
                 reasons.append("CRC32C_MISMATCH")
@@ -464,12 +446,13 @@ async def build_corpus(request: Request):
 
             for line in content.splitlines():
 
-                # Blank lines ignored.
+                # Blank lines are ignored.
                 if not line.strip():
                     continue
 
                 try:
                     parsed = json.loads(line)
+
                 except json.JSONDecodeError:
                     jsonl_invalid = True
                     break
@@ -479,16 +462,13 @@ async def build_corpus(request: Request):
             if jsonl_invalid:
                 reasons.append("JSONL_INVALID")
 
-            # Every file must contain at least one row.
-            if not rows and not jsonl_invalid:
+            # No non-blank rows.
+            elif not rows:
                 reasons.append("SCHEMA_INVALID")
 
 
         # ----------------------------------------------------
         # ROW SCHEMA
-        #
-        # We validate all successfully parsed rows even if
-        # another object-level error already exists.
         # ----------------------------------------------------
 
         valid_rows = []
@@ -503,21 +483,27 @@ async def build_corpus(request: Request):
 
 
         # ----------------------------------------------------
-        # OBJECT REJECTION
+        # OBJECT RESULT
         # ----------------------------------------------------
+
+        reasons = sort_reason_codes(reasons)
 
         if reasons:
 
             rejected_objects.append({
-                "uri": uri if isinstance(uri, str) else None,
-                "reasonCodes": sorted_reason_codes(reasons)
+                "uri": (
+                    uri
+                    if isinstance(uri, str)
+                    else None
+                ),
+                "reasonCodes": reasons
             })
 
             continue
 
 
         # ----------------------------------------------------
-        # ACCEPTED OBJECT -> LINEAGE
+        # LINEAGE
         # ----------------------------------------------------
 
         lineage.append({
@@ -529,19 +515,27 @@ async def build_corpus(request: Request):
 
 
         # ----------------------------------------------------
-        # CANONICALIZE ACCEPTED ROWS
+        # CANONICALIZE ROWS
         # ----------------------------------------------------
 
         for row in valid_rows:
 
-            event_dt = parse_time(row["eventTime"])
+            event_dt = parse_time(
+                row["eventTime"]
+            )
 
-            parsed_rows.append({
+            accepted_rows.append({
                 "id": row["id"],
-                "entity": canonical_text(row["entity"]),
-                "eventTime": normalize_event_time(event_dt),
+                "entity": canonicalize(
+                    row["entity"]
+                ),
+                "eventTime": normalize_event_time(
+                    event_dt
+                ),
                 "revision": row["revision"],
-                "text": canonical_text(row["text"])
+                "text": canonicalize(
+                    row["text"]
+                )
             })
 
 
@@ -551,41 +545,46 @@ async def build_corpus(request: Request):
 
     groups = {}
 
-    for row in parsed_rows:
+    for row in accepted_rows:
 
-        dedup_key = (
+        key = (
             row["entity"],
             row["eventTime"],
             row["text"]
         )
 
-        groups.setdefault(dedup_key, []).append(row)
+        groups.setdefault(
+            key,
+            []
+        ).append(row)
 
 
-    retained = []
+    retained_rows = []
 
     for rows in groups.values():
 
-        # Highest revision first.
+        # Highest revision wins.
         #
-        # If revisions tie, UTF-8-byte-smallest ID wins.
+        # On equal revision:
+        # smallest UTF-8 ID wins.
         rows.sort(
             key=lambda row: (
                 -row["revision"],
-                utf8_key(row["id"])
+                utf8(row["id"])
             )
         )
 
         winner = rows[0]
 
-        retained.append(winner)
+        retained_rows.append(winner)
 
-        # Every other row is a duplicate loser.
         for loser in rows[1:]:
 
             rejected_rows.append({
                 "id": loser["id"],
-                "reasonCodes": ["DUPLICATE"]
+                "reasonCodes": [
+                    "DUPLICATE"
+                ]
             })
 
 
@@ -595,52 +594,74 @@ async def build_corpus(request: Request):
 
     policy_valid = False
 
-    min_dt = None
-    max_dt = None
-    threshold = None
+    min_time = None
+    max_time = None
+    contamination_threshold = None
 
     if isinstance(policy, dict):
 
-        min_dt = parse_time(policy.get("minTime"))
-        max_dt = parse_time(policy.get("maxTime"))
+        min_time = parse_time(
+            policy.get("minTime")
+        )
 
-        threshold = policy.get(
+        max_time = parse_time(
+            policy.get("maxTime")
+        )
+
+        contamination_threshold = policy.get(
             "contaminationThreshold"
         )
 
         if (
-            min_dt is not None
-            and max_dt is not None
-            and min_dt <= max_dt
-            and isinstance(threshold, (int, float))
-            and not isinstance(threshold, bool)
-            and isfinite(threshold)
-            and 0 <= threshold <= 1
+            min_time is not None
+            and max_time is not None
+            and min_time <= max_time
+            and isinstance(
+                contamination_threshold,
+                (int, float)
+            )
+            and not isinstance(
+                contamination_threshold,
+                bool
+            )
+            and isfinite(
+                contamination_threshold
+            )
+            and 0 <= contamination_threshold <= 1
         ):
             policy_valid = True
 
 
     candidates = []
 
-    for row in retained:
+    for row in retained_rows:
 
         if not policy_valid:
 
             rejected_rows.append({
                 "id": row["id"],
-                "reasonCodes": ["POLICY_INVALID"]
+                "reasonCodes": [
+                    "POLICY_INVALID"
+                ]
             })
 
             continue
 
 
-        row_dt = parse_time(row["eventTime"])
+        row_time = parse_time(
+            row["eventTime"]
+        )
 
-        if row_dt < min_dt or row_dt > max_dt:
+        if (
+            row_time < min_time
+            or row_time > max_time
+        ):
 
             rejected_rows.append({
                 "id": row["id"],
-                "reasonCodes": ["OUT_OF_WINDOW"]
+                "reasonCodes": [
+                    "OUT_OF_WINDOW"
+                ]
             })
 
             continue
@@ -659,19 +680,18 @@ async def build_corpus(request: Request):
         "test": []
     }
 
-
     for row in candidates:
 
-        first_byte = hashlib.sha256(
+        digest = hashlib.sha256(
             row["entity"].encode("utf-8")
-        ).digest()[0]
+        ).digest()
 
-        bucket = first_byte % 10
+        bucket = digest[0] % 10
 
-        if 0 <= bucket <= 5:
+        if bucket <= 5:
             splits["train"].append(row)
 
-        elif 6 <= bucket <= 7:
+        elif bucket <= 7:
             splits["validation"].append(row)
 
         else:
@@ -679,7 +699,7 @@ async def build_corpus(request: Request):
 
 
     # ========================================================
-    # TRAIN WORD SETS
+    # TRAIN CONTAMINATION
     # ========================================================
 
     train_word_sets = [
@@ -688,17 +708,18 @@ async def build_corpus(request: Request):
     ]
 
 
-    # ========================================================
-    # CONTAMINATION
-    # ========================================================
-
-    for split_name in ("validation", "test"):
+    for split_name in (
+        "validation",
+        "test"
+    ):
 
         kept = []
 
         for row in splits[split_name]:
 
-            current_words = word_set(row["text"])
+            current_words = word_set(
+                row["text"]
+            )
 
             contaminated = False
 
@@ -709,7 +730,10 @@ async def build_corpus(request: Request):
                     train_words
                 )
 
-                if similarity >= threshold:
+                if (
+                    similarity
+                    >= contamination_threshold
+                ):
                     contaminated = True
                     break
 
@@ -742,40 +766,39 @@ async def build_corpus(request: Request):
         "test"
     ):
 
-        # Primary key: UTF-8 bytes of ID.
-        #
-        # Secondary key: compact row JSON.
         splits[split_name].sort(
             key=lambda row: (
-                utf8_key(row["id"]),
+                utf8(row["id"]),
                 compact_json(row).encode("utf-8")
             )
         )
 
-
-        # Exact JSONL bytes.
-        payload = b""
+        lines = []
 
         for row in splits[split_name]:
 
-            line = compact_json(row) + "\n"
+            lines.append(
+                compact_json(row)
+                + "\n"
+            )
 
-            payload += line.encode("utf-8")
-
+        artifact = "".join(
+            lines
+        ).encode("utf-8")
 
         digests[split_name] = hashlib.sha256(
-            payload
+            artifact
         ).hexdigest()
 
 
     # ========================================================
-    # REJECTED OBJECTS SORT
+    # SORT REJECTED OBJECTS
     # ========================================================
 
     rejected_objects.sort(
         key=lambda item: (
             (
-                utf8_key(item["uri"])
+                utf8(item["uri"])
                 if isinstance(item["uri"], str)
                 else b""
             ),
@@ -785,31 +808,31 @@ async def build_corpus(request: Request):
 
 
     # ========================================================
-    # REJECTED ROWS SORT
+    # SORT REJECTED ROWS
     # ========================================================
 
     rejected_rows.sort(
         key=lambda item: (
-            utf8_key(item["id"]),
+            utf8(item["id"]),
             compact_json(item).encode("utf-8")
         )
     )
 
 
     # ========================================================
-    # LINEAGE SORT
+    # SORT LINEAGE
     # ========================================================
 
     lineage.sort(
         key=lambda item: (
-            utf8_key(item["uri"]),
+            utf8(item["uri"]),
             compact_json(item).encode("utf-8")
         )
     )
 
 
     # ========================================================
-    # FINAL RESPONSE
+    # RESPONSE
     # ========================================================
 
     return {
