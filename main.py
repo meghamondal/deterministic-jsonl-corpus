@@ -13,7 +13,7 @@ app = FastAPI()
 
 # --- Helper Utilities & Regexes ---
 
-# URI: gs://bucket/object where bucket and object must not be empty
+# URI: gs://bucket/object (bucket and object path must be non-empty)
 GS_URI_REGEX = re.compile(r"^gs://[^/]+/.+$")
 
 # CRC32C: exactly 8 lowercase hex digits
@@ -27,17 +27,17 @@ ISO_TIMESTAMP_REGEX = re.compile(
     r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?(Z|([+-])(\d{2}):(\d{2}))$"
 )
 
-# JavaScript safe integers limit
-JS_MAX_SAFE_INTEGER = 2**53 - 1
+# JS Safe Integer Limit (2^53 - 1)
+JS_MAX_SAFE_INTEGER = 9007199254740991
 
 
 def compute_crc32c_hex(content_bytes: bytes) -> str:
-    """Computes CRC32C over exact UTF-8 bytes and returns 8-char hex string."""
+    """Computes CRC32C over exact UTF-8 bytes and returns 8-char lowercase hex string."""
     checksum = google_crc32c.Checksum(content_bytes)
     return checksum.digest().hex().lower()
 
 
-def parse_iso8601(time_str: str) -> Optional[datetime]:
+def parse_iso8601(time_str: Any) -> Optional[datetime]:
     """Validates calendar, time offset rules, and normalizes to UTC datetime."""
     if not isinstance(time_str, str):
         return None
@@ -90,7 +90,6 @@ def canonicalize_text(text: str) -> str:
     """Unicode NFKC, lowercase, trim, and collapse Unicode whitespace to one ASCII space."""
     text = unicodedata.normalize("NFKC", text)
     text = text.lower()
-    # Replace all Unicode whitespace characters with ASCII space
     words = text.split()
     return " ".join(words)
 
@@ -101,7 +100,6 @@ def extract_words(text: str) -> Set[str]:
     current_word = []
     for char in text:
         cat = unicodedata.category(char)
-        # Letter categories (L*) or Number categories (N*)
         if cat.startswith("L") or cat.startswith("N"):
             current_word.append(char)
         else:
@@ -170,10 +168,10 @@ async def build_corpus(request: Request):
         elif thresh < 0.0 or thresh > 1.0:
             policy_valid = False
 
-    # --- Processing Objects & Integrity Check ---
+    # --- Processing Objects & Identity/Integrity Checks ---
 
-    accepted_objects = []  # List of dicts containing parsed object info & valid rows
-    rejected_objects = []  # List of {"uri": ..., "reasonCodes": [...] }
+    accepted_objects = []
+    rejected_objects = []
     lineage = []
 
     for obj in objects:
@@ -190,7 +188,7 @@ async def build_corpus(request: Request):
 
         reasons = set()
 
-        # 1. URI_INVALID
+        # 1. URI_INVALID (Must be string and match gs://bucket/object)
         supplied_uri = uri if isinstance(uri, str) else None
         if not isinstance(uri, str) or not GS_URI_REGEX.match(uri):
             reasons.add("URI_INVALID")
@@ -201,7 +199,9 @@ async def build_corpus(request: Request):
 
         if not gen_valid or not fetched_gen_valid:
             reasons.add("GENERATION_INVALID")
-        elif generation != fetched_gen:
+
+        # GENERATION_MISMATCH applies when both are valid OR when they are both strings that differ
+        if isinstance(generation, str) and isinstance(fetched_gen, str) and generation != fetched_gen:
             reasons.add("GENERATION_MISMATCH")
 
         # 3. CRC32C_INVALID & CRC32C_MISMATCH
@@ -224,7 +224,7 @@ async def build_corpus(request: Request):
             non_blank_lines = [line for line in lines if line.strip() != ""]
 
             if len(non_blank_lines) == 0:
-                reasons.add("SCHEMA_INVALID")  # File must contain at least one row
+                reasons.add("SCHEMA_INVALID")  # Empty content / no valid rows
             else:
                 json_parse_failed = False
                 row_schema_failed = False
@@ -240,20 +240,18 @@ async def build_corpus(request: Request):
                         row_schema_failed = True
                         break
 
-                    # Must contain EXACTLY id, entity, eventTime, revision, text
+                    # Must contain EXACTLY the 5 keys: id, entity, eventTime, revision, text
                     keys = set(row_data.keys())
                     expected_keys = {"id", "entity", "eventTime", "revision", "text"}
                     if keys != expected_keys:
                         row_schema_failed = True
                         break
 
-                    r_id, r_ent, r_time, r_rev, r_text = (
-                        row_data["id"],
-                        row_data["entity"],
-                        row_data["eventTime"],
-                        row_data["revision"],
-                        row_data["text"],
-                    )
+                    r_id = row_data["id"]
+                    r_ent = row_data["entity"]
+                    r_time = row_data["eventTime"]
+                    r_rev = row_data["revision"]
+                    r_text = row_data["text"]
 
                     if not (
                         isinstance(r_id, str)
@@ -264,7 +262,7 @@ async def build_corpus(request: Request):
                         row_schema_failed = True
                         break
 
-                    # Revision must be non-negative safe integer
+                    # Revision must be non-negative safe integer (exclude booleans!)
                     if (
                         type(r_rev) is not int
                         or isinstance(r_rev, bool)
@@ -287,7 +285,6 @@ async def build_corpus(request: Request):
                             "eventTime_dt": parsed_time,
                             "revision": r_rev,
                             "text": r_text,
-                            "raw_row": row_data,
                         }
                     )
 
@@ -320,7 +317,7 @@ async def build_corpus(request: Request):
 
     # --- Processing Rows: Canonicalization & Deduplication ---
 
-    retained_rows_map = {}  # tuple -> best_row
+    retained_rows_map = {}
     all_retained_candidates = []
 
     for obj in accepted_objects:
@@ -344,9 +341,6 @@ async def build_corpus(request: Request):
                 retained_rows_map[key] = canon_row
             else:
                 existing = retained_rows_map[key]
-                # Tie-breaking rules:
-                # 1. Higher revision wins
-                # 2. UTF-8 byte smallest ID wins
                 existing_id_bytes = existing["id"].encode("utf-8")
                 new_id_bytes = canon_row["id"].encode("utf-8")
 
@@ -381,7 +375,6 @@ async def build_corpus(request: Request):
         if not policy_valid:
             add_row_rejection(row_id, "POLICY_INVALID")
         else:
-            # Check inclusive window
             if r["eventTime_dt"] < min_dt or r["eventTime_dt"] > max_dt:
                 add_row_rejection(row_id, "OUT_OF_WINDOW")
             else:
@@ -406,7 +399,6 @@ async def build_corpus(request: Request):
         else:
             test_rows.append(r)
 
-    # Extract word sets for train rows
     train_word_sets = [extract_words(tr["text"]) for tr in train_rows]
 
     final_train = train_rows
@@ -435,7 +427,6 @@ async def build_corpus(request: Request):
     # --- Sorting and Serialization ---
 
     def row_sort_key(r: dict) -> Tuple[bytes, str]:
-        # Sort by UTF-8 bytes of ID, then compact row JSON for tie
         compact_dict = {
             "id": r["id"],
             "entity": r["entity"],
@@ -471,14 +462,12 @@ async def build_corpus(request: Request):
 
     # --- Formatting Rejected Objects, Rejected Rows, and Lineage ---
 
-    # Sort rejected objects
     def rejected_obj_sort_key(obj: dict) -> Tuple[bytes, str]:
-        uri_str = obj["uri"] if obj["uri"] is not None else ""
-        return (uri_str.encode("utf-8"), json_compact(obj))
+        uri_bytes = obj["uri"].encode("utf-8") if isinstance(obj["uri"], str) else b""
+        return (uri_bytes, json_compact(obj))
 
     sorted_rejected_objects = sorted(rejected_objects, key=rejected_obj_sort_key)
 
-    # Format and sort rejected rows
     formatted_rejected_rows = []
     for r_id, codes in rejected_rows_dict.items():
         codes_sorted = sorted(list(codes), key=lambda x: x.encode("utf-8"))
@@ -489,13 +478,11 @@ async def build_corpus(request: Request):
 
     sorted_rejected_rows = sorted(formatted_rejected_rows, key=rejected_row_sort_key)
 
-    # Sort lineage
     def lineage_sort_key(lin: dict) -> Tuple[bytes, str]:
         return (lin["uri"].encode("utf-8"), json_compact(lin))
 
     sorted_lineage = sorted(lineage, key=lineage_sort_key)
 
-    # Construct Final Response Body
     response_data = {
         "splits": {
             "train": train_serialized,
